@@ -1,0 +1,599 @@
+import asyncio
+import os
+import sqlite3
+import threading
+import time
+import subprocess
+from datetime import datetime, timedelta
+from collections import deque
+
+import requests
+import yt_dlp
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+
+TOKEN = ""
+ADMIN_ID = 0
+
+CARD_NUMBER = ""
+CARD_HOLDER = ""
+MONTHLY_PRICE = 50000
+
+SMS_API_KEY = ""
+SMS_LINE = ""
+ADMIN_PHONE = ""
+
+DB_PATH = "robot_data.db"
+DOWNLOAD_FOLDER = "./downloads"
+
+FREE_DOWNLOADS = 3
+MAX_FILE_SIZE_MB = 45
+MAX_MONTHS = 24
+MAX_CONCURRENT = 2
+
+download_queue = deque()
+active_downloads = 0
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, join_date TEXT, free_downloads INTEGER DEFAULT 3, subscription_expire TEXT, total_downloads INTEGER DEFAULT 0, is_banned INTEGER DEFAULT 0)")
+    c.execute("CREATE TABLE IF NOT EXISTS payments (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, months INTEGER, amount INTEGER, receipt_file_id TEXT, status TEXT DEFAULT 'pending', date TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS force_channels (id INTEGER PRIMARY KEY AUTOINCREMENT, channel_id TEXT, channel_name TEXT, invite_link TEXT, is_active INTEGER DEFAULT 1)")
+    conn.commit()
+    conn.close()
+
+def get_user(uid):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT * FROM users WHERE user_id=?", (uid,))
+    u = c.fetchone()
+    conn.close()
+    return u
+
+def add_user(uid, username, first_name):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO users (user_id, username, first_name, join_date, free_downloads) VALUES (?,?,?,?,?)", (uid, username, first_name, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), FREE_DOWNLOADS))
+    conn.commit()
+    conn.close()
+
+def can_dl(uid):
+    u = get_user(uid)
+    if not u: return False, "/start"
+    if u[7]: return False, "⛔ مسدود"
+    if u[5]:
+        if datetime.strptime(u[5], "%Y-%m-%d %H:%M:%S") > datetime.now():
+            return True, None
+    if u[4] > 0: return True, None
+    return False, "❌ دانلود تموم شده"
+
+def use_free(uid):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE users SET free_downloads=free_downloads-1, total_downloads=total_downloads+1 WHERE user_id=? AND free_downloads>0", (uid,))
+    conn.commit()
+    conn.close()
+
+def add_dl(uid):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE users SET total_downloads=total_downloads+1 WHERE user_id=?", (uid,))
+    conn.commit()
+    conn.close()
+
+def is_sub(uid):
+    u = get_user(uid)
+    return u and u[5] and datetime.strptime(u[5], "%Y-%m-%d %H:%M:%S") > datetime.now()
+
+def get_quality(uid):
+    u = get_user(uid)
+    if u and u[5]:
+        expire = datetime.strptime(u[5], "%Y-%m-%d %H:%M:%S")
+        if expire > datetime.now():
+            months = max(1, (expire - datetime.strptime(u[3], "%Y-%m-%d %H:%M:%S")).days // 30)
+            if months >= 6: return "1080", "👑 Full HD"
+            return "720", "⭐ HD"
+    return "360", "🆓 پایه"
+
+def add_sub(uid, months):
+    u = get_user(uid)
+    if u[5]:
+        exp = datetime.strptime(u[5], "%Y-%m-%d %H:%M:%S")
+        if exp < datetime.now(): exp = datetime.now()
+    else:
+        exp = datetime.now()
+    new_exp = exp + timedelta(days=months*30)
+    max_exp = datetime.now() + timedelta(days=MAX_MONTHS*30)
+    if new_exp > max_exp: new_exp = max_exp
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE users SET subscription_expire=? WHERE user_id=?", (new_exp.strftime("%Y-%m-%d %H:%M:%S"), uid))
+    conn.commit()
+    conn.close()
+
+def ban_user(uid, st):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE users SET is_banned=? WHERE user_id=?", (st, uid))
+    conn.commit()
+    conn.close()
+
+def all_users():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT user_id FROM users WHERE is_banned=0")
+    return c.fetchall()
+
+def get_channels():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT * FROM force_channels WHERE is_active=1")
+    return c.fetchall()
+
+def add_channel(cid, cname, link):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO force_channels (channel_id, channel_name, invite_link) VALUES (?,?,?)", (cid, cname, link))
+    conn.commit()
+    conn.close()
+
+def remove_channel(cid):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE force_channels SET is_active=0 WHERE channel_id=?", (cid,))
+    conn.commit()
+    conn.close()
+
+async def check_join(uid, ctx):
+    not_joined = []
+    for ch in get_channels():
+        try:
+            m = await ctx.bot.get_chat_member(ch[1], uid)
+            if m.status in ['left', 'kicked', 'banned']: not_joined.append(ch)
+        except: pass
+    return not_joined
+
+def sms(msg):
+    try:
+        requests.post("https://api.sms.ir/v1/send/bulk", json={"lineNumber": SMS_LINE, "messageText": msg, "mobiles": [ADMIN_PHONE]}, headers={"x-api-key": SMS_API_KEY}, timeout=10)
+    except: pass
+
+def net_monitor():
+    fail = 0
+    sent = False
+    while True:
+        try:
+            r = subprocess.run(["ping", "-c", "1", "-W", "3", "8.8.8.8"], capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                if sent: sms("✅ اینترنت وصل شد."); sent = False
+                fail = 0
+            else: fail += 1
+        except: fail += 1
+        if fail >= 3 and not sent:
+            sms("🚨 اینترنت ربات قطع شد!")
+            sent = True
+        time.sleep(60)
+
+def user_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💰 خرید اشتراک", callback_data="buy")],
+        [InlineKeyboardButton("📊 وضعیت حساب", callback_data="status")],
+        [InlineKeyboardButton("📞 پشتیبانی", url=f"tg://user?id={ADMIN_ID}")]
+    ])
+
+def month_kb():
+    kb = []
+    for m in [1,2,3,6,12,24]:
+        kb.append([InlineKeyboardButton(f"{m} ماه - {m*MONTHLY_PRICE:,} تومان", callback_data=f"m_{m}")])
+    kb.append([InlineKeyboardButton("🔙 بازگشت", callback_data="back")])
+    return InlineKeyboardMarkup(kb)
+
+def admin_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 آمار", callback_data="astat")],
+        [InlineKeyboardButton("📨 پیام همگانی", callback_data="abroad")],
+        [InlineKeyboardButton("📋 رسیدها", callback_data="apend")],
+        [InlineKeyboardButton("👤 جستجو", callback_data="asearch")],
+        [InlineKeyboardButton("🚫 مسدود/آزاد", callback_data="aban")],
+        [InlineKeyboardButton("⚙️ عضویت اجباری", callback_data="achan")]
+    ])
+
+def chan_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ افزودن", callback_data="cadd")],
+        [InlineKeyboardButton("➖ حذف", callback_data="crem")],
+        [InlineKeyboardButton("📋 لیست", callback_data="clist")],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data="aback")]
+    ])
+
+class Prog:
+    def __init__(self, msg, quality_label):
+        self.msg = msg
+        self.qlabel = quality_label
+        self.t = time.time()
+        self.dl = 0
+        self.tot = 0
+        self.sp = 0
+        self.title = ""
+    def hook(self, d):
+        if d['status'] == 'downloading':
+            self.dl = d.get('downloaded_bytes', 0)
+            self.tot = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
+            self.sp = d.get('speed', 0)
+            self.title = (d.get('info_dict', {}) or {}).get('title', '')[:40]
+            if time.time() - self.t > 3:
+                self.t = time.time()
+                asyncio.ensure_future(self.update())
+    async def update(self):
+        try:
+            if self.tot > 0:
+                pct = self.dl / self.tot * 100
+                bar = "█" * int(pct/5) + "░" * (20 - int(pct/5))
+                cur = self.dl / 1048576
+                tot = self.tot / 1048576
+                spd = self.sp / 1024
+                eta = (self.tot - self.dl) / self.sp if self.sp else 0
+                await self.msg.edit_text(f"📥 دانلود...\n🎬 {self.title}\n📊 {self.qlabel}\n📈 [{bar}] {pct:.1f}%\n💾 {cur:.1f}/{tot:.1f}MB\n⚡ {spd:.0f}KB/s\n⏱ {int(eta//60)}:{int(eta%60):02d}", parse_mode="Markdown")
+        except: pass
+
+def ydl_opts(q):
+    opts = {
+        'outtmpl': f'{DOWNLOAD_FOLDER}/%(title).100s.%(ext)s',
+        'quiet': True,
+        'no_warnings': True,
+        'format': f'bestvideo[height<={q}]+bestaudio/best[height<={q}]/best',
+        'merge_output_format': 'mp4',
+        'noplaylist': True,
+        'max_filesize': MAX_FILE_SIZE_MB*1048576,
+        'socket_timeout': 60,
+    }
+    return opts
+
+async def process(url, update, msg, uid):
+    global active_downloads
+    q, label = get_quality(uid)
+    p = Prog(msg, f"{label} ({q}p)")
+    try:
+        os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
+        opts = ydl_opts(q)
+        opts['progress_hooks'] = [p.hook]
+        loop = asyncio.get_event_loop()
+        info = await loop.run_in_executor(None, lambda: yt_dlp.YoutubeDL(opts).extract_info(url, download=True))
+        fn = yt_dlp.YoutubeDL(opts).prepare_filename(info)
+        if not os.path.exists(fn):
+            base = fn.rsplit('.', 1)[0]
+            for ext in ['mp4','mkv','webm','mov','avi','mp3','m4a','wav','flac','ogg','jpg','jpeg','png','webp','gif','bmp','tiff']:
+                if os.path.exists(f"{base}.{ext}"): fn = f"{base}.{ext}"; break
+            else:
+                files = [os.path.join(DOWNLOAD_FOLDER, f) for f in os.listdir(DOWNLOAD_FOLDER)]
+                if files: fn = max(files, key=os.path.getctime)
+                else: raise Exception("فایل دانلود نشد")
+        await msg.edit_text("📤 در حال ارسال...")
+        ext = fn.split('.')[-1].lower()
+        cap = (info.get('title') or '')[:100]
+        with open(fn, 'rb') as f:
+            if ext in ['mp4','avi','mov','mkv','webm']:
+                await update.message.reply_video(f, caption=f"🎬 {cap}", supports_streaming=True)
+            elif ext in ['mp3','wav','ogg','m4a','flac']:
+                await update.message.reply_audio(f, title=cap)
+            elif ext in ['jpg','jpeg','png','webp','bmp','tiff']:
+                await update.message.reply_photo(f, caption=f"🖼 {cap}")
+            elif ext == 'gif':
+                await update.message.reply_animation(f)
+            else:
+                await update.message.reply_document(f, caption=f"📎 {cap}")
+        os.remove(fn)
+        await msg.edit_text("✅ دانلود با موفقیت انجام شد!")
+        if is_sub(uid): add_dl(uid)
+        else: use_free(uid)
+    except Exception as e:
+        await msg.edit_text(f"❌ خطا: {str(e)[:200]}")
+    finally:
+        active_downloads -= 1
+
+async def queue_worker():
+    global active_downloads
+    while True:
+        if download_queue and active_downloads < MAX_CONCURRENT:
+            url, update, uid = download_queue.popleft()
+            active_downloads += 1
+            q, label = get_quality(uid)
+            msg = await update.message.reply_text(f"🔍 نوبت شما!\n📊 {label}")
+            asyncio.create_task(process(url, update, msg, uid))
+        await asyncio.sleep(1)
+
+async def start(update, ctx):
+    u = update.effective_user
+    add_user(u.id, u.username, u.first_name)
+    nj = await check_join(u.id, ctx)
+    if nj:
+        kb = []
+        for ch in nj:
+            link = ch[3] or f"https://t.me/{ch[1].replace('@','')}"
+            kb.append([InlineKeyboardButton(f"📢 {ch[2] or ch[1]}", url=link)])
+        kb.append([InlineKeyboardButton("✅ عضو شدم", callback_data="jcheck")])
+        await update.message.reply_text("⛔ ابتدا عضو کانال‌ها شوید:", reply_markup=InlineKeyboardMarkup(kb))
+        return
+    q, label = get_quality(u.id)
+    await update.message.reply_text(
+        f"👋 سلام {u.first_name}!\n\n🎬 ربات دانلودر همه‌کاره\n📊 کیفیت: {label}\n🆓 {FREE_DOWNLOADS} دانلود رایگان\n💳 اشتراک {MONTHLY_PRICE:,} تومان\n\n🔗 لینک بفرست!",
+        reply_markup=user_kb()
+    )
+
+async def handle_link(update, ctx):
+    global active_downloads
+    url = update.message.text.strip()
+    uid = update.effective_user.id
+    if not url.startswith("http"): return
+    nj = await check_join(uid, ctx)
+    if nj:
+        kb = []
+        for ch in nj:
+            link = ch[3] or f"https://t.me/{ch[1].replace('@','')}"
+            kb.append([InlineKeyboardButton(f"📢 {ch[2] or ch[1]}", url=link)])
+        kb.append([InlineKeyboardButton("✅ عضو شدم", callback_data="jcheck")])
+        await update.message.reply_text("⛔ عضو کانال‌ها شوید:", reply_markup=InlineKeyboardMarkup(kb))
+        return
+    ok, err = can_dl(uid)
+    if not ok:
+        await update.message.reply_text(err, reply_markup=user_kb())
+        return
+    q, label = get_quality(uid)
+    if active_downloads >= MAX_CONCURRENT:
+        download_queue.append((url, update, uid))
+        await update.message.reply_text(f"⏳ صف دانلود...\n🔢 نفر {len(download_queue)}\n📊 {label}")
+        return
+    active_downloads += 1
+    msg = await update.message.reply_text(f"🔍 شروع دانلود...\n📊 {label}")
+    asyncio.create_task(process(url, update, msg, uid))
+
+async def handle_photo(update, ctx):
+    u = update.effective_user
+    p = update.message.photo[-1]
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO payments (user_id, months, amount, receipt_file_id, date) VALUES (?,0,0,?,?)", (u.id, p.file_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    pid = c.lastrowid
+    conn.commit()
+    conn.close()
+    await update.message.reply_text("✅ رسید دریافت شد. منتظر تأیید ادمین باشید.")
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ تأیید", callback_data=f"app_{pid}"),
+         InlineKeyboardButton("❌ رد", callback_data=f"rej_{pid}")]
+    ])
+    await ctx.bot.send_photo(ADMIN_ID, p.file_id,
+        caption=f"📩 رسید پرداخت\n👤 @{u.username or ''} ({u.id})\n📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        reply_markup=kb)
+
+async def button(update, ctx):
+    q = update.callback_query
+    await q.answer()
+    d = q.data
+    uid = q.from_user.id
+
+    if d == "jcheck":
+        nj = await check_join(uid, ctx)
+        if not nj:
+            ql, label = get_quality(uid)
+            try: await q.message.edit_text(f"✅ تأیید شد!\n📊 {label}\n🔗 لینک بفرست!", reply_markup=user_kb())
+            except: await q.message.reply_text(f"✅ تأیید شد!\n📊 {label}\n🔗 لینک بفرست!", reply_markup=user_kb())
+        else: await q.answer("❌ هنوز عضو نشدی!", show_alert=True)
+
+    elif d == "buy":
+        try: await q.message.edit_text(f"📅 مدت اشتراک:\n💵 ماهانه {MONTHLY_PRICE:,} تومان", reply_markup=month_kb())
+        except: await q.message.reply_text(f"📅 مدت اشتراک:\n💵 ماهانه {MONTHLY_PRICE:,} تومان", reply_markup=month_kb())
+
+    elif d.startswith("m_"):
+        m = int(d.split("_")[1])
+        amt = m * MONTHLY_PRICE
+        txt = f"🧾 فاکتور خرید\n📦 {m} ماه\n💵 {amt:,} تومان\n💳 {CARD_NUMBER}\n👤 {CARD_HOLDER}\n\n📌 عکس رسید رو بفرست."
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="buy")]])
+        try: await q.message.edit_text(txt, reply_markup=kb)
+        except: await q.message.reply_text(txt, reply_markup=kb)
+
+    elif d == "status":
+        u = get_user(uid)
+        ql, label = get_quality(uid)
+        msg = f"📊 وضعیت حساب\n🆔 {uid}\n"
+        if u[7]: msg += "⛔ مسدود\n"
+        elif u[5] and datetime.strptime(u[5],"%Y-%m-%d %H:%M:%S") > datetime.now():
+            msg += f"⭐ اشتراک تا {u[5][:10]}\n📊 {label}\n📥 {u[6]} دانلود\n"
+        else: msg += f"🆓 رایگان: {u[4]}\n📊 {label}\n"
+        await q.message.reply_text(msg, reply_markup=user_kb())
+
+    elif d == "back":
+        try: await q.message.edit_text("📌 منوی اصلی:", reply_markup=user_kb())
+        except: pass
+
+    elif d.startswith("app_") and uid == ADMIN_ID:
+        pid = int(d.split("_")[1])
+        pay = sqlite3.connect(DB_PATH).cursor().execute("SELECT * FROM payments WHERE id=?", (pid,)).fetchone()
+        if not pay:
+            await q.answer("رسید پیدا نشد!", show_alert=True)
+            return
+        ctx.user_data['app_pid'] = pid
+        ctx.user_data['app_uid'] = pay[1]
+        await q.message.reply_text(f"📋 رسید #{pid}\n👤 کاربر: {pay[1]}\n\nتعداد ماه رو بفرست (۱-۲۴):")
+
+    elif d.startswith("rej_") and uid == ADMIN_ID:
+        pid = int(d.split("_")[1])
+        pay = sqlite3.connect(DB_PATH).cursor().execute("SELECT * FROM payments WHERE id=?", (pid,)).fetchone()
+        if pay:
+            sqlite3.connect(DB_PATH).cursor().execute("UPDATE payments SET status='rejected' WHERE id=?", (pid,))
+            sqlite3.connect(DB_PATH).commit()
+            await ctx.bot.send_message(pay[1], "❌ پرداخت شما تأیید نشد.\nلطفاً با پشتیبانی تماس بگیرید.")
+        await q.answer("❌ رد شد", show_alert=True)
+
+    elif d == "astat" and uid == ADMIN_ID:
+        ucount = len(all_users())
+        chans = len(get_channels())
+        txt = f"📊 آمار ربات\n👥 کاربران: {ucount}\n📢 کانال: {chans}\n🔵 همزمان: {active_downloads}\n⏳ صف: {len(download_queue)}"
+        try: await q.message.edit_text(txt, reply_markup=admin_kb())
+        except: await q.message.reply_text(txt, reply_markup=admin_kb())
+
+    elif d == "abroad" and uid == ADMIN_ID:
+        ctx.user_data['broadcast'] = True
+        await q.message.reply_text("📨 پیام همگانی رو بفرست:")
+
+    elif d == "apend" and uid == ADMIN_ID:
+        pays = sqlite3.connect(DB_PATH).cursor().execute("SELECT * FROM payments WHERE status='pending'").fetchall()
+        if not pays:
+            try: await q.message.edit_text("📋 رسید در انتظاری وجود نداره.", reply_markup=admin_kb())
+            except: await q.message.reply_text("📋 رسید در انتظاری وجود نداره.", reply_markup=admin_kb())
+        else:
+            msg = "📋 رسیدهای در انتظار:\n\n"
+            for p in pays: msg += f"🔹 #{p[0]} | کاربر: {p[1]} | {p[6][:10]}\n"
+            await q.message.reply_text(msg, reply_markup=admin_kb())
+
+    elif d == "asearch" and uid == ADMIN_ID:
+        ctx.user_data['search'] = True
+        await q.message.reply_text("🔍 شناسه کاربر رو بفرست:")
+
+    elif d == "aban" and uid == ADMIN_ID:
+        ctx.user_data['ban'] = True
+        await q.message.reply_text("🚫 شناسه کاربر برای مسدود/آزاد کردن:")
+
+    elif d == "achan" and uid == ADMIN_ID:
+        try: await q.message.edit_text("⚙️ تنظیمات عضویت اجباری:", reply_markup=chan_kb())
+        except: await q.message.reply_text("⚙️ تنظیمات عضویت اجباری:", reply_markup=chan_kb())
+
+    elif d == "cadd" and uid == ADMIN_ID:
+        ctx.user_data['cadd'] = True
+        await q.message.reply_text("➕ فرمت:\n@channel_id|نام کانال|لینک دعوت")
+
+    elif d == "crem" and uid == ADMIN_ID:
+        ctx.user_data['crem'] = True
+        chs = get_channels()
+        if not chs:
+            await q.message.reply_text("کانالی وجود نداره.")
+            return
+        msg = "کانال‌های اجباری:\n\n"
+        for c in chs: msg += f"{c[1]} - {c[2]}\n"
+        msg += "\nآیدی کانال رو بفرست (مثلاً @test):"
+        await q.message.reply_text(msg)
+
+    elif d == "clist" and uid == ADMIN_ID:
+        chs = get_channels()
+        if not chs:
+            try: await q.message.edit_text("کانالی وجود نداره.", reply_markup=admin_kb())
+            except: await q.message.reply_text("کانالی وجود نداره.", reply_markup=admin_kb())
+        else:
+            msg = "📋 لیست کانال‌های اجباری:\n\n"
+            for c in chs: msg += f"• {c[2]} ({c[1]})\n"
+            await q.message.reply_text(msg, reply_markup=chan_kb())
+
+    elif d == "aback" and uid == ADMIN_ID:
+        try: await q.message.edit_text("🎛️ پنل مدیریت:", reply_markup=admin_kb())
+        except: await q.message.reply_text("🎛️ پنل مدیریت:", reply_markup=admin_kb())
+
+async def admin_text(update, ctx):
+    uid = update.effective_user.id
+    if uid != ADMIN_ID: return
+    txt = update.message.text.strip()
+
+    if ctx.user_data.get('app_pid'):
+        try:
+            months = int(txt)
+            if months < 1 or months > 24:
+                await update.message.reply_text("❌ بین ۱ تا ۲۴")
+                return
+            pid = ctx.user_data['app_pid']
+            tuid = ctx.user_data['app_uid']
+            add_sub(tuid, months)
+            sqlite3.connect(DB_PATH).cursor().execute("UPDATE payments SET status='approved', months=?, amount=? WHERE id=?", (months, months*MONTHLY_PRICE, pid))
+            sqlite3.connect(DB_PATH).commit()
+            await update.message.reply_text(f"✅ {months} ماه تأیید شد.")
+            await ctx.bot.send_message(tuid, f"✅ پرداخت تأیید شد!\n⭐ {months} ماه اضافه شد.")
+            del ctx.user_data['app_pid'], ctx.user_data['app_uid']
+        except: await update.message.reply_text("❌ عدد معتبر بفرست.")
+        return
+
+    if ctx.user_data.get('broadcast'):
+        users = all_users()
+        ok = 0
+        for u in users:
+            try: await ctx.bot.send_message(u[0], f"📢 پیام همگانی:\n\n{txt}"); ok += 1
+            except: pass
+        await update.message.reply_text(f"✅ به {ok}/{len(users)} کاربر ارسال شد.")
+        del ctx.user_data['broadcast']
+        return
+
+    if ctx.user_data.get('search'):
+        try:
+            u = get_user(int(txt))
+            if u:
+                ql, label = get_quality(int(txt))
+                await update.message.reply_text(
+                    f"👤 اطلاعات کاربر\n"
+                    f"🆔 {u[0]}\n👤 {u[2]} (@{u[1] or ''})\n"
+                    f"📅 عضویت: {u[3]}\n🆓 رایگان: {u[4]}\n"
+                    f"⭐ اشتراک: {u[5] or 'ندارد'}\n📊 {label}\n"
+                    f"📥 دانلود: {u[6]}\n🚫 {'مسدود' if u[7] else 'فعال'}"
+                )
+            else: await update.message.reply_text("❌ کاربر پیدا نشد.")
+        except: await update.message.reply_text("❌ شناسه نامعتبر.")
+        del ctx.user_data['search']
+        return
+
+    if ctx.user_data.get('ban'):
+        try:
+            uid2 = int(txt)
+            u = get_user(uid2)
+            if u:
+                ban_user(uid2, 1 if u[7]==0 else 0)
+                await update.message.reply_text(f"✅ کاربر {'مسدود' if u[7]==0 else 'آزاد'} شد.")
+            else: await update.message.reply_text("❌ کاربر پیدا نشد.")
+        except: await update.message.reply_text("❌ نامعتبر.")
+        del ctx.user_data['ban']
+        return
+
+    if ctx.user_data.get('cadd'):
+        parts = txt.split('|')
+        if len(parts) < 2:
+            await update.message.reply_text("❌ فرمت صحیح: @id|نام|لینک")
+            return
+        add_channel(parts[0].strip(), parts[1].strip(), parts[2].strip() if len(parts)>2 else "")
+        await update.message.reply_text(f"✅ {parts[0]} اضافه شد.")
+        del ctx.user_data['cadd']
+        return
+
+    if ctx.user_data.get('crem'):
+        remove_channel(txt.strip())
+        await update.message.reply_text(f"✅ کانال حذف شد.")
+        del ctx.user_data['crem']
+        return
+
+async def panel(update, ctx):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ فقط ادمین.")
+        return
+    await update.message.reply_text("🎛️ پنل مدیریت", reply_markup=admin_kb())
+
+async def main():
+    os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
+    init_db()
+    threading.Thread(target=net_monitor, daemon=True).start()
+    asyncio.create_task(queue_worker())
+
+    print("🚀 ربات روشن شد...")
+    print(f"📁 دانلود: {DOWNLOAD_FOLDER}")
+    print(f"🗄️ دیتابیس: {DB_PATH}")
+    print(f"🔵 همزمان: {MAX_CONCURRENT}")
+
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("panel", panel))
+    app.add_handler(CallbackQueryHandler(button))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Entity("url"), handle_link))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Entity("url"), admin_text))
+    await app.run_polling()
+
+if __name__ == "__main__":
+    import socket, socks
+    socks.set_default_proxy(socks.SOCKS5, "127.0.0.1", 10808)
+    socket.socket = socks.socksocket
+    import nest_asyncio
+    nest_asyncio.apply()
+    asyncio.run(main())
